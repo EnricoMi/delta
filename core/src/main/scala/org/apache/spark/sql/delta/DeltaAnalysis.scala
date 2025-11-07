@@ -354,7 +354,7 @@ class DeltaAnalysis(session: SparkSession)
       val newTarget = stripTempViewWrapper(table).transformUp { case DeltaRelation(lr) => lr }
       val indices = newTarget.collect {
         case DeltaFullTable(index) => index
-      }
+      }.distinct
       if (indices.isEmpty) {
         // Not a Delta table at all, do not transform
         d
@@ -834,7 +834,7 @@ class DeltaAnalysis(session: SparkSession)
 
 /** Matchers for dealing with a Delta table. */
 object DeltaRelation extends DeltaLogging {
-  def unapply(plan: LogicalPlan): Option[LogicalRelation] = plan match {
+  def unapply(plan: LogicalPlan): Option[LogicalPlan] = plan match {
     case dsv2 @ DataSourceV2Relation(d: DeltaTableV2, _, _, _, options) =>
       Some(fromV2Relation(d, dsv2, options))
     case lr @ DeltaTable(_) => Some(lr)
