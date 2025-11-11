@@ -35,9 +35,11 @@ import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
-import org.apache.spark.sql.catalyst.expressions.{And, Attribute, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference, Expression, Literal, SortOrder}
 import org.apache.spark.sql.catalyst.plans.logical.DeleteFromTable
+import org.apache.spark.sql.catalyst.plans.logical.Sort
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, CharVarcharUtils}
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.metric.SQLMetric
@@ -257,8 +259,14 @@ case class WriteIntoDelta(
         (newFiles, addFiles, txn.filterFiles(predicates).map(_.remove))
       case (SaveMode.Overwrite, Some(conditions)) if txn.snapshot.version >= 0 =>
         val constraints = extractConstraints(sparkSession, conditions)
+        val inPartitionOrder = if (partitionColumns.nonEmpty) {
+          extractInPartitionOrder(data)
+        } else {
+          Seq.empty
+        }
 
-        val removedFileActions = removeFiles(sparkSession, txn, conditions)
+        val removedFileActions = removeFiles(
+          sparkSession, txn, conditions, inPartitionOrder)
         val cdcExistsInRemoveOp = removedFileActions.exists(_.isInstanceOf[AddCDCFile])
 
         // The above REMOVE will not produce explicit CDF data when persistent DV is enabled.
@@ -381,16 +389,38 @@ case class WriteIntoDelta(
     txn.writeFiles(data, Some(options))
   }
 
+  private def extractInPartitionOrder(df: DataFrame): Seq[SortOrder] = {
+    // get hold of the output ordering without materializing an adaptive plan
+    val outputOrdering = df.queryExecution.executedPlan match {
+      case AdaptiveSparkPlanExec(inputPlan, _, _, _, _) => inputPlan.outputOrdering
+      case p => p.outputOrdering
+    }
+    // un-resolve attribute references so they can get resolved against the delete plan
+    outputOrdering.map { order =>
+      order.mapChildren {
+        case AttributeReference(name, _, _, _) => UnresolvedAttribute(name)
+        case expr => throw new UnsupportedOperationException(
+          s"Sort expression not supported: $expr")
+      }.asInstanceOf[SortOrder]
+    }
+  }
+
   private def removeFiles(
       spark: SparkSession,
       txn: OptimisticTransaction,
-      conditions: Seq[Expression]): Seq[Action] = {
+      conditions: Seq[Expression],
+      inPartitionOrder: Seq[SortOrder]): Seq[Action] = {
     val relation = LogicalRelation(
         txn.deltaLog.createRelation(snapshotToUseOpt = Some(txn.snapshot),
           catalogTableOpt = txn.catalogTable))
+    val orderPreservingRelation = if (inPartitionOrder.nonEmpty) {
+      Sort(inPartitionOrder, global = false, relation)
+    } else {
+      relation
+    }
     val processedCondition = conditions.reduceOption(And)
     val command = spark.sessionState.analyzer.execute(
-      DeleteFromTable(relation, processedCondition.getOrElse(Literal.TrueLiteral)))
+      DeleteFromTable(orderPreservingRelation, processedCondition.getOrElse(Literal.TrueLiteral)))
     spark.sessionState.analyzer.checkAnalysis(command)
     val (deleteActions, deleteMetrics) =
       command.asInstanceOf[DeleteCommand].performDelete(spark, txn.deltaLog, txn)

@@ -502,7 +502,7 @@ class DeltaAnalysis(session: SparkSession)
       val newTarget = stripTempViewWrapper(table).transformUp { case DeltaRelation(lr) => lr }
       val indices = newTarget.collect {
         case DeltaFullTable(_, index) => index
-      }
+      }.distinct
       if (indices.isEmpty) {
         // Not a Delta table at all, do not transform
         d
@@ -1370,7 +1370,7 @@ class DeltaAnalysis(session: SparkSession)
 object DeltaRelation extends DeltaLogging {
   val KEEP_AS_V2_RELATION_TAG = new TreeNodeTag[Unit]("__keep_as_v2_relation")
 
-  def unapply(plan: LogicalPlan): Option[LogicalRelation] = plan match {
+  def unapply(plan: LogicalPlan): Option[LogicalPlan] = plan match {
     case dsv2 @ DataSourceV2Relation(d: DeltaTableV2, _, _, _, options) =>
       Some(fromV2Relation(d, dsv2, options))
     case lr @ DeltaTable(_) => Some(lr)
