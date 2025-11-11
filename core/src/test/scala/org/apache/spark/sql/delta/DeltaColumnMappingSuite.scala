@@ -33,6 +33,10 @@ import org.scalatest.GivenWhenThen
 
 import org.apache.spark.sql.{DataFrame, QueryTest, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, NullsFirst, SortOrder}
+import org.apache.spark.sql.catalyst.plans.logical.Sort
+import org.apache.spark.sql.connector.expressions.NamedReference
+import org.apache.spark.sql.delta.commands.DeleteCommand
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -654,7 +658,13 @@ class DeltaColumnMappingSuite extends QueryTest
   }
 
   test("overwrite partitioned with sortWithinPartitions") {
-    assert(Runtime.getRuntime.maxMemory() <= 512 * 1024 * 1024, "Run this test with -Xmx512m")
+    val spillingVeryLikely = Runtime.getRuntime.maxMemory() <= 512 * 1024 * 1024
+    val deltaTestingEnabled = System.getenv("DELTA_TESTING") != null
+    assert(spillingVeryLikely || deltaTestingEnabled,
+      "Either run this test with -Xmx512m to cause spilling or " +
+        "run this test with env var DELTA_TESTING=1 to assert the delete plan. " +
+        "Both is even better.")
+
     withTempDir { dir =>
       import org.apache.spark.sql.SaveMode
       import org.apache.spark.sql.expressions.Window
@@ -687,7 +697,8 @@ class DeltaColumnMappingSuite extends QueryTest
         .mode(SaveMode.Overwrite)
         .save(dir.toString)
 
-      assert(unorderedRows.count() === 0)
+      assert(deltaTestingEnabled && DeleteCommand.EXECUTED_PLAN.isEmpty)
+      assert(spillingVeryLikely && unorderedRows.count() === 0)
 
       df(5, 2)
         .repartition(2, $"year")
@@ -699,7 +710,16 @@ class DeltaColumnMappingSuite extends QueryTest
         .option("replaceWhere", "id in (0, 1, 2, 3, 4, 5)")
         .save(dir.toString)
 
-      assert(unorderedRows.count() === 0)
+      assert(deltaTestingEnabled && DeleteCommand.EXECUTED_PLAN.exists(_.exists {
+        case Sort(mutable.ArrayBuffer(
+        SortOrder(AttributeReference("year", _, _, _), Ascending, NullsFirst, _),
+        SortOrder(AttributeReference("id", _, _, _), Ascending, NullsFirst, _),
+        SortOrder(AttributeReference("day", _, _, _), Ascending, NullsFirst, _),
+        ), _, _) => true
+        case _ => false
+      }))
+      DeleteCommand.EXECUTED_PLAN = None
+      assert(spillingVeryLikely && unorderedRows.count() === 0)
 
       df(5, 2)
         .orderBy($"year", $"id", $"day")
@@ -710,7 +730,16 @@ class DeltaColumnMappingSuite extends QueryTest
         .option("replaceWhere", "id in (0, 1, 2, 3, 4, 5)")
         .save(dir.toString)
 
-      assert(unorderedRows.count() === 0)
+      assert(deltaTestingEnabled && DeleteCommand.EXECUTED_PLAN.exists(_.exists {
+        case Sort(mutable.ArrayBuffer(
+        SortOrder(AttributeReference("year", _, _, _), Ascending, NullsFirst, _),
+        SortOrder(AttributeReference("id", _, _, _), Ascending, NullsFirst, _),
+        SortOrder(AttributeReference("day", _, _, _), Ascending, NullsFirst, _),
+        ), _, _) => true
+        case _ => false
+      }))
+      DeleteCommand.EXECUTED_PLAN = None
+      assert(spillingVeryLikely && unorderedRows.count() === 0)
     }
   }
 

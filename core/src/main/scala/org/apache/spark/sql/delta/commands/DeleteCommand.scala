@@ -31,6 +31,7 @@ import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, EqualNullSafe, Expression, If, Literal, Not}
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.logical.{DeltaDelete, LogicalPlan, Sort}
+import org.apache.spark.sql.delta.util.{Utils => DeltaUtils}
 import org.apache.spark.sql.execution.command.LeafRunnableCommand
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.metric.SQLMetrics.{createMetric, createTimingMetric}
@@ -439,9 +440,10 @@ case class DeleteCommand(
           .filter(new Column(filterCondition))
       }
 
-      // scalastyle:off println
-      Console.println(s"dfToWrite: ${dfToWrite.queryExecution.analyzed}")
-      // scalastyle:on println
+      // make actual executed delete plan available for tests
+      if (DeltaUtils.isTesting) {
+        DeleteCommand.EXECUTED_PLAN = Some(dfToWrite.queryExecution.analyzed)
+      }
       txn.writeFiles(dfToWrite)
     }
   }
@@ -470,6 +472,9 @@ object DeleteCommand {
 
   val FILE_NAME_COLUMN: String = "_input_file_name_"
   val FINDING_TOUCHED_FILES_MSG: String = "Finding files to rewrite for DELETE operation"
+
+  // used in tests
+  var EXECUTED_PLAN: Option[LogicalPlan] = None
 
   def rewritingFilesMsg(numFilesToRewrite: Long): String =
     s"Rewriting $numFilesToRewrite files for DELETE operation"
