@@ -653,6 +653,67 @@ class DeltaColumnMappingSuite extends QueryTest
 
   }
 
+  test("overwrite partitioned with sortWithinPartitions") {
+    assert(Runtime.getRuntime.maxMemory() <= 512 * 1024 * 1024, "Run this test with -Xmx512m")
+    withTempDir { dir =>
+      import org.apache.spark.sql.SaveMode
+      import org.apache.spark.sql.expressions.Window
+
+      def days(days: Int, parts: Int = 2): DataFrame = spark.range(0, days, 1, parts)
+        .withColumnRenamed("id", "day")
+        .withColumn("year", $"day" / 365 cast "int")
+      def ids(ids: Int, parts: Int = 2): DataFrame = spark.range(0, ids, 1, parts)
+        .asInstanceOf[DataFrame]
+      def df(i: Int, d: Int, parts: Int = 2): DataFrame =
+        days(d, parts).join(ids(i, parts))
+          .withColumn("val", rand())
+          .select($"year", $"id", $"day", $"val")
+
+      val prev_row = lag($"row", 1).over(Window.partitionBy($"file").orderBy($"id"))
+      def unorderedRows: DataFrame =
+        spark
+          .read
+          .parquet(dir.toString)
+          .select($"id", monotonically_increasing_id().as("row"), input_file_name().as("file"))
+          .withColumn("ordered", prev_row + 1 === $"row")
+          .where(!$"ordered")
+
+      df(700000, 2)
+        .repartition(2, $"year")
+        .sortWithinPartitions($"year", $"id", $"day")
+        .write
+        .partitionBy("year")
+        .format("delta")
+        .mode(SaveMode.Overwrite)
+        .save(dir.toString)
+
+      assert(unorderedRows.count() === 0)
+
+      df(5, 2)
+        .repartition(2, $"year")
+        .sortWithinPartitions($"year", $"id", $"day")
+        .write
+        .partitionBy("year")
+        .format("delta")
+        .mode(SaveMode.Overwrite)
+        .option("replaceWhere", "id in (0, 1, 2, 3, 4, 5)")
+        .save(dir.toString)
+
+      assert(unorderedRows.count() === 0)
+
+      df(5, 2)
+        .orderBy($"year", $"id", $"day")
+        .write
+        .partitionBy("year")
+        .format("delta")
+        .mode(SaveMode.Overwrite)
+        .option("replaceWhere", "id in (0, 1, 2, 3, 4, 5)")
+        .save(dir.toString)
+
+      assert(unorderedRows.count() === 0)
+    }
+  }
+
   testColumnMapping("create table through dataframe should " +
     "auto bumps the version and rebuild schema metadata/drop dataframe metadata") { mode =>
     // existing ids should be dropped/ignored and ids should be regenerated
