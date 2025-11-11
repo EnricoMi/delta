@@ -33,6 +33,10 @@ import org.scalatest.GivenWhenThen
 
 import org.apache.spark.sql.{DataFrame, QueryTest, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, NullsFirst, SortOrder}
+import org.apache.spark.sql.catalyst.plans.logical.Sort
+import org.apache.spark.sql.connector.expressions.NamedReference
+import org.apache.spark.sql.delta.commands.DeleteCommand
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -651,6 +655,95 @@ class DeltaColumnMappingSuite extends QueryTest
         Map(DeltaConfigs.COLUMN_MAPPING_MODE.key -> mode))
     }
 
+  }
+
+  test("overwrite partitioned with sortWithinPartitions") {
+    val spillingVeryLikely = Runtime.getRuntime.maxMemory() <= 1024 * 1024 * 1024
+    val deltaTestingEnabled = System.getenv("DELTA_TESTING") != null
+    assert(spillingVeryLikely || deltaTestingEnabled,
+      s"Either run this test with -Xmx1g to cause spilling or " +
+        "run this test with env var DELTA_TESTING=1 to assert the delete plan. " +
+        "Both is even better.")
+
+    withTempDir { dir =>
+      import org.apache.spark.sql.SaveMode
+      import org.apache.spark.sql.expressions.Window
+
+      def days(days: Int, parts: Int = 2): DataFrame = spark.range(0, days, 1, parts)
+        .withColumnRenamed("id", "day")
+        .withColumn("year", $"day" / 365 cast "int")
+      def ids(ids: Int, parts: Int = 2): DataFrame = spark.range(0, ids, 1, parts)
+        .asInstanceOf[DataFrame]
+      def df(i: Int, d: Int, parts: Int = 2): DataFrame =
+        days(d, parts).join(ids(i, parts))
+          .withColumn("val", rand())
+          .select($"year", $"id", $"day", $"val")
+
+      val prev_row = lag($"row", 1).over(Window.partitionBy($"file").orderBy($"id"))
+      def unorderedRows: DataFrame =
+        spark
+          .read
+          .parquet(dir.toString)
+          .select($"id", monotonically_increasing_id().as("row"), input_file_name().as("file"))
+          .withColumn("ordered", prev_row + 1 === $"row")
+          .where(!$"ordered")
+
+      // we need enough ids for spilling to occur
+      // with -Xmx512m, we need 700000
+      // with -Xmx1g (default in build.sbt), we need 2500000
+      df(3000000, 2)
+        .repartition(2, $"year")
+        .sortWithinPartitions($"year", $"id", $"day")
+        .write
+        .partitionBy("year")
+        .format("delta")
+        .mode(SaveMode.Overwrite)
+        .save(dir.toString)
+
+      assert(!deltaTestingEnabled || DeleteCommand.EXECUTED_PLAN.isEmpty)
+      assert(!spillingVeryLikely || unorderedRows.count() === 0)
+
+      df(5, 2)
+        .repartition(2, $"year")
+        .sortWithinPartitions($"year", $"id", $"day")
+        .write
+        .partitionBy("year")
+        .format("delta")
+        .mode(SaveMode.Overwrite)
+        .option("replaceWhere", "id in (0, 1, 2, 3, 4, 5)")
+        .save(dir.toString)
+
+      assert(!deltaTestingEnabled || DeleteCommand.EXECUTED_PLAN.exists(_.exists {
+        case Sort(mutable.ArrayBuffer(
+        SortOrder(AttributeReference("year", _, _, _), Ascending, NullsFirst, _),
+        SortOrder(AttributeReference("id", _, _, _), Ascending, NullsFirst, _),
+        SortOrder(AttributeReference("day", _, _, _), Ascending, NullsFirst, _),
+        ), _, _) => true
+        case _ => false
+      }))
+      DeleteCommand.EXECUTED_PLAN = None
+      assert(!spillingVeryLikely || unorderedRows.count() === 0)
+
+      df(5, 2)
+        .orderBy($"year", $"id", $"day")
+        .write
+        .partitionBy("year")
+        .format("delta")
+        .mode(SaveMode.Overwrite)
+        .option("replaceWhere", "id in (0, 1, 2, 3, 4, 5)")
+        .save(dir.toString)
+
+      assert(!deltaTestingEnabled || DeleteCommand.EXECUTED_PLAN.exists(_.exists {
+        case Sort(mutable.ArrayBuffer(
+        SortOrder(AttributeReference("year", _, _, _), Ascending, NullsFirst, _),
+        SortOrder(AttributeReference("id", _, _, _), Ascending, NullsFirst, _),
+        SortOrder(AttributeReference("day", _, _, _), Ascending, NullsFirst, _),
+        ), _, _) => true
+        case _ => false
+      }))
+      DeleteCommand.EXECUTED_PLAN = None
+      assert(!spillingVeryLikely || unorderedRows.count() === 0)
+    }
   }
 
   testColumnMapping("create table through dataframe should " +
